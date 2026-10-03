@@ -140,8 +140,17 @@
     this.mouse = { x: 0, y: 0, down: false, button: 0 };
     this.selected = 0;            // 快捷栏选中格 0-9
     this.time = 0;                // 累计毫秒
-    this.dayLen = opts.dayLen || 120000; // 一天一夜总时长(ms)，第1阶段仅占位
+    this.dayLen = opts.dayLen || 120000; // 一天一夜总时长(ms)
     this.dayCount = 1;
+    this.dayTime = opts.dayTime || 0;    // 当前周期内时间(ms)
+    this._wasNight = false;
+    this.zombies = [];
+    this.zombieSpawnTimer = 0;
+    this.maxZombies = opts.maxZombies || 8;
+    this.attackCooldown = 0;
+    this._attackAnim = 0;
+    this.jumpQueue = 0;                  // 跳跃缓冲(ms)
+    this.dead = false;
     this.message = null; this.messageTime = 0;
     this.uiPick = null; this.craftCooldown = 0;
 
@@ -248,11 +257,9 @@
 
   // ---------- 玩家 ----------
   Game.prototype._initPlayer = function () {
-    const cx = (this.W >> 1);
-    const sy = this.surface[cx];
+    const sp = this._findSafeSpawn();
     this.player = {
-      x: cx * TILE + (TILE - 14) / 2,
-      y: (sy - 3) * TILE,
+      x: sp.x, y: sp.y,
       w: 14, h: 28,
       vx: 0, vy: 0,
       onGround: false,
@@ -263,6 +270,40 @@
       miningTx: -1, miningTy: -1, miningProg: 0
     };
     this.camera = { x: 0, y: 0 };
+  };
+
+  // 寻找安全出生点: 附近无树的列, 并挖出 3x4 口袋避免卡墙
+  Game.prototype._findSafeSpawn = function () {
+    const cx = (this.W >> 1);
+    let col = -1;
+    for (let off = 0; off < this.W && col < 0; off++) {
+      const cands = off === 0 ? [cx] : [cx + off, cx - off];
+      for (let ci = 0; ci < cands.length; ci++) {
+        const x = cands[ci];
+        if (x < 3 || x > this.W - 4) continue;
+        let ok = true;
+        outer: for (let dx = -2; dx <= 2; dx++) {
+          for (let dy = 1; dy <= 6; dy++) {
+            const t = this.getTile(x + dx, this.surface[x] - dy);
+            if (t === T.WOOD || t === T.LEAVES) { ok = false; break outer; }
+          }
+        }
+        if (ok) { col = x; break; }
+      }
+    }
+    if (col < 0) col = cx;
+    const sy = this.surface[col];
+    for (let dx = -1; dx <= 1; dx++) for (let dy = 1; dy <= 4; dy++) this.setTile(col + dx, sy - dy, T.AIR);
+    return { x: col * TILE + (TILE - 14) / 2, y: (sy - 4) * TILE };
+  };
+
+  Game.prototype.respawn = function () {
+    const sp = this._findSafeSpawn();
+    const p = this.player;
+    p.x = sp.x; p.y = sp.y; p.vx = 0; p.vy = 0;
+    p.hp = p.maxHp; p.invuln = 2000; p.facing = 1;
+    this.dead = false;
+    this.setMessage('你已重生');
   };
 
   // ---------- 背包 ----------
@@ -301,6 +342,18 @@
       left -= can;
     }
     return 0;
+  };
+
+  // 检查能否容纳 count 个 id (不实际放入)
+  Game.prototype._canAdd = function (id, count) {
+    const max = this._stackMax(id);
+    let cap = 0;
+    for (let i = 0; i < this.inv.length; i++) {
+      if (this.inv[i].item === id) cap += (max - this.inv[i].count);
+      else if (this.inv[i].item === null) cap += max;
+      if (cap >= count) return true;
+    }
+    return false;
   };
 
   Game.prototype.countItem = function (id) {
@@ -359,6 +412,7 @@
       const d = this.nearestWorkbenchDist();
       if (d > 4) return { ok: false, reason: '需要靠近工作台 (当前距离 ' + d.toFixed(1) + ' 格)' };
     }
+    if (!this._canAdd(r.out.id, r.out.n)) return { ok: false, reason: '背包已满, 无法容纳产物' };
     return { ok: true, reason: '可合成' };
   };
 
@@ -378,6 +432,220 @@
     if (a < 0 || b < 0 || a >= this.inv.length || b >= this.inv.length || a === b) return false;
     const t = this.inv[a]; this.inv[a] = this.inv[b]; this.inv[b] = t;
     return true;
+  };
+
+  // ---------- 昼夜 ----------
+  Game.prototype.dayPhase = function () { return (this.dayTime % this.dayLen) / this.dayLen; };
+  Game.prototype.isNight = function () { return this.dayPhase() >= 0.5; };
+  Game.prototype.ambientLight = function () {
+    const c = Math.cos((this.dayPhase() - 0.25) * Math.PI * 2);
+    return 0.575 + 0.425 * c;
+  };
+  Game.prototype._updateDayNight = function () {
+    this.dayTime = (this.dayTime + STEP_MS) % this.dayLen;
+    const night = this.isNight();
+    if (this._wasNight && !night) {
+      this.zombies = [];
+      this.dayCount++;
+      this.setMessage('天亮了 · 僵尸自燃 · 第 ' + this.dayCount + ' 天');
+    }
+    this._wasNight = night;
+  };
+
+  // ---------- 僵尸 ----------
+  Game.prototype._spawnZombie = function () {
+    const p = this.player;
+    const pcol = Math.floor((p.x + p.w / 2) / TILE);
+    const side = Math.random() < 0.5 ? -1 : 1;
+    const dist = 18 + ((Math.random() * 14) | 0);
+    let col = pcol + side * dist;
+    col = Math.max(2, Math.min(this.W - 3, col));
+    const sy = this.surface[col];
+    this.setTile(col, sy - 1, T.AIR);
+    this.zombies.push({
+      x: col * TILE + 1, y: (sy - 2) * TILE,
+      w: 12, h: 26,
+      vx: 0, vy: 0, onGround: false, blockedX: false,
+      facing: -side,
+      hp: 8, maxHp: 8,
+      speed: 1.4 + Math.random() * 0.7
+    });
+  };
+  Game.prototype.spawnZombie = function (side) {
+    const p = this.player;
+    const pcol = Math.floor((p.x + p.w / 2) / TILE);
+    let col = pcol + (side || 1) * 6;
+    col = Math.max(2, Math.min(this.W - 3, col));
+    const sy = this.surface[col];
+    this.zombies.push({ x: col * TILE + 1, y: (sy - 2) * TILE, w: 12, h: 26, vx: 0, vy: 0, onGround: false, blockedX: false, facing: -(side || 1), hp: 8, maxHp: 8, speed: 1.5 });
+  };
+  Game.prototype._updateZombies = function () {
+    const p = this.player;
+    if (this.isNight()) {
+      this.zombieSpawnTimer -= STEP_MS;
+      if (this.zombieSpawnTimer <= 0 && this.zombies.length < this.maxZombies) {
+        this._spawnZombie();
+        this.zombieSpawnTimer = 1500 + Math.random() * 1500;
+      }
+    } else {
+      this.zombieSpawnTimer = 0;
+    }
+    for (let i = this.zombies.length - 1; i >= 0; i--) {
+      const z = this.zombies[i];
+      if (z.hp <= 0) { this.zombies.splice(i, 1); continue; }
+      const dx = (p.x + p.w / 2) - (z.x + z.w / 2);
+      z.facing = dx > 0 ? 1 : -1;
+      z.vx = z.facing * z.speed;
+      z.vy += GRAVITY;
+      if (z.vy > 12) z.vy = 12;
+      this._moveEntity(z);
+      if (z.blockedX && z.onGround) z.vy = -7.2;
+      if (z.y > this.H * TILE) { this.zombies.splice(i, 1); continue; }
+      if (!this.dead && this._aabb(p, z) && p.invuln <= 0) {
+        p.hp -= 1;
+        p.invuln = 1000;
+        p.vx = z.facing * 4;
+        p.vy = -4;
+        this.setMessage('受到攻击! HP ' + Math.max(0, p.hp));
+        if (p.hp <= 0) { this.dead = true; this.respawn(); }
+      }
+    }
+  };
+
+  // ---------- 战斗 ----------
+  Game.prototype.tryAttack = function () {
+    if (this.attackCooldown > 0) return false;
+    const sd = this._hasSword();
+    if (!sd) return false;
+    const p = this.player;
+    const hx = p.facing > 0 ? p.x + p.w : p.x - 1.5 * TILE;
+    const hy = p.y - 2;
+    const hw = 1.5 * TILE, hh = p.h + 4;
+    let hit = false, killed = 0;
+    for (let i = 0; i < this.zombies.length; i++) {
+      const z = this.zombies[i];
+      if (hx < z.x + z.w && hx + hw > z.x && hy < z.y + z.h && hy + hh > z.y) {
+        z.hp -= sd.dmg;
+        z.vx = p.facing * 5; z.vy = -3;
+        hit = true;
+        if (z.hp <= 0) { killed++; const coins = 1 + ((Math.random() * 3) | 0); p.coins += coins; this.setMessage('击杀僵尸! +' + coins + ' 金币'); }
+      }
+    }
+    this.attackCooldown = 350;
+    this._attackAnim = 120;
+    if (hit && killed === 0) this.setMessage('命中!');
+    return hit;
+  };
+
+  // ---------- 昼夜 / 实体 渲染 ----------
+  Game.prototype._skyColors = function () {
+    const amb = this.ambientLight();
+    const dayTop = [58, 123, 213], dayBot = [159, 208, 255];
+    const nightTop = [10, 10, 32], nightBot = [26, 26, 58];
+    const top = [0, 1, 2].map(function (i) { return Math.round(nightTop[i] + (dayTop[i] - nightTop[i]) * amb); });
+    const bot = [0, 1, 2].map(function (i) { return Math.round(nightBot[i] + (dayBot[i] - nightBot[i]) * amb); });
+    return { top: 'rgb(' + top.join(',') + ')', bot: 'rgb(' + bot.join(',') + ')', amb: amb };
+  };
+  Game.prototype._drawCelestial = function (ctx, sky) {
+    const ph = this.dayPhase();
+    if (ph < 0.5) {
+      const mp = ph / 0.5, a = mp * Math.PI;
+      const cx = this.viewW * mp, cy = this.viewH * 0.42 - Math.sin(a) * this.viewH * 0.3;
+      ctx.fillStyle = 'rgba(255,240,180,0.3)'; ctx.beginPath(); ctx.arc(cx, cy, 30, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff6c8'; ctx.beginPath(); ctx.arc(cx, cy, 20, 0, Math.PI * 2); ctx.fill();
+    } else {
+      const mp = (ph - 0.5) / 0.5, a = mp * Math.PI;
+      const cx = this.viewW * mp, cy = this.viewH * 0.42 - Math.sin(a) * this.viewH * 0.3;
+      const starA = 1 - sky.amb;
+      if (starA > 0.05) {
+        ctx.fillStyle = 'rgba(255,255,255,' + starA.toFixed(3) + ')';
+        for (let i = 0; i < 70; i++) {
+          const sx = (i * 97 + 13) % this.viewW;
+          const syp = (i * 53 + 7) % (this.viewH * 0.6);
+          const tw = (Math.sin(this.time * 0.002 + i) + 1) * 0.5;
+          if (tw > 0.4) ctx.fillRect(sx, syp, 1, 1);
+        }
+      }
+      ctx.fillStyle = '#e8e8f0'; ctx.beginPath(); ctx.arc(cx, cy, 15, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = sky.bot; ctx.beginPath(); ctx.arc(cx + 5, cy - 2, 13, 0, Math.PI * 2); ctx.fill();
+    }
+  };
+  Game.prototype._drawLighting = function (ctx) {
+    const amb = this.ambientLight();
+    const cam = this.camera;
+    const x0 = Math.floor(cam.x / TILE), x1 = Math.floor((cam.x + this.viewW) / TILE) + 1;
+    const y0 = Math.floor(cam.y / TILE), y1 = Math.floor((cam.y + this.viewH) / TILE) + 1;
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        if (this.getTile(tx, ty) !== T.AIR) continue;
+        const surf = this.surface[tx];
+        let light;
+        if (ty <= surf) light = amb;
+        else { light = amb * Math.max(0, 1 - (ty - surf) / 7); }
+        const alpha = Math.max(0, Math.min(0.93, 1 - light));
+        if (alpha > 0.02) { ctx.fillStyle = 'rgba(0,0,0,' + alpha.toFixed(3) + ')'; ctx.fillRect(tx * TILE - cam.x, ty * TILE - cam.y, TILE, TILE); }
+      }
+    }
+    ctx.globalCompositeOperation = 'lighter';
+    for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) {
+      if (this.getTile(tx, ty) === T.TORCH) {
+        const cx = tx * TILE - cam.x + TILE / 2, cy = ty * TILE - cam.y + TILE / 2;
+        const rad = 3.2 * TILE;
+        const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+        grd.addColorStop(0, 'rgba(255,200,90,0.85)');
+        grd.addColorStop(0.5, 'rgba(255,160,60,0.32)');
+        grd.addColorStop(1, 'rgba(255,140,40,0)');
+        ctx.fillStyle = grd; ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    if (amb < 0.7) {
+      const p = this.player;
+      const cx = p.x + p.w / 2 - cam.x, cy = p.y + p.h / 2 - cam.y;
+      const rad = 2.6 * TILE;
+      const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+      grd.addColorStop(0, 'rgba(255,255,255,' + (0.22 * (1 - amb)).toFixed(3) + ')');
+      grd.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = grd; ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  };
+  Game.prototype._drawZombies = function (ctx) {
+    const cam = this.camera;
+    for (let i = 0; i < this.zombies.length; i++) {
+      const z = this.zombies[i];
+      const sx = Math.round(z.x - cam.x), sy = Math.round(z.y - cam.y);
+      ctx.fillStyle = '#3a5a2a'; ctx.fillRect(sx, sy + 8, 12, 14);
+      ctx.fillStyle = '#6b8b4a'; ctx.fillRect(sx + 1, sy, 10, 9);
+      ctx.fillStyle = '#1a1a1a'; ctx.fillRect(sx + 3, sy + 3, 2, 2); ctx.fillRect(sx + 7, sy + 3, 2, 2);
+      ctx.fillStyle = '#2a2a2a'; ctx.fillRect(sx + 1, sy + 22, 4, 4); ctx.fillRect(sx + 7, sy + 22, 4, 4);
+      if (z.hp < z.maxHp) {
+        ctx.fillStyle = '#400'; ctx.fillRect(sx - 1, sy - 5, 14, 3);
+        ctx.fillStyle = '#f33'; ctx.fillRect(sx - 1, sy - 5, 14 * (z.hp / z.maxHp), 3);
+      }
+    }
+  };
+  Game.prototype._drawHUD = function (ctx) {
+    const p = this.player;
+    const maxHearts = Math.ceil(p.maxHp / 2);
+    for (let i = 0; i < maxHearts; i++) {
+      const x = 8 + i * 15, y = 8;
+      const full = (i + 1) * 2 <= p.hp;
+      const half = !full && i * 2 + 1 <= p.hp;
+      ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(x - 1, y - 1, 14, 13);
+      ctx.fillStyle = full ? '#e23' : (half ? '#a22' : '#411');
+      ctx.fillRect(x + 2, y, 3, 2); ctx.fillRect(x + 7, y, 3, 2);
+      ctx.fillRect(x + 1, y + 2, 10, 3);
+      ctx.fillRect(x + 2, y + 5, 8, 2);
+      ctx.fillRect(x + 3, y + 7, 6, 1);
+      ctx.fillRect(x + 4, y + 8, 4, 1);
+      ctx.fillRect(x + 5, y + 9, 2, 1);
+    }
+    ctx.font = '13px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillStyle = '#ffe066'; ctx.fillText('金币: ' + p.coins, 8, 28);
+    ctx.fillStyle = '#fff'; ctx.fillText('第 ' + this.dayCount + ' 天 ' + (this.isNight() ? '(夜)' : '(昼)'), 8, 46);
+    const s = this.selectedSlot();
+    const nm = (s && s.item) ? ITEMS[s.item].name + (s.count > 1 ? ' ×' + s.count : '') : '空手';
+    ctx.fillStyle = '#ffe08a'; ctx.fillText('手持: ' + nm, 8, 64);
   };
 
   // ---------- 输入 ----------
@@ -466,35 +734,40 @@
   };
 
   // ---------- 碰撞 ----------
-  Game.prototype._moveAndCollide = function () {
-    const p = this.player;
-    // X 轴
-    p.x += p.vx;
+  Game.prototype._moveAndCollide = function () { this._moveEntity(this.player); };
+
+  // 通用分轴 AABB 碰撞 (玩家与僵尸共用)
+  Game.prototype._moveEntity = function (e) {
+    e.blockedX = false;
+    e.x += e.vx;
     {
-      const top = Math.floor(p.y / TILE);
-      const bot = Math.floor((p.y + p.h - 0.001) / TILE);
-      if (p.vx > 0) {
-        const col = Math.floor((p.x + p.w - 0.001) / TILE);
-        for (let r = top; r <= bot; r++) if (this.isSolid(col, r)) { p.x = col * TILE - p.w; p.vx = 0; break; }
-      } else if (p.vx < 0) {
-        const col = Math.floor(p.x / TILE);
-        for (let r = top; r <= bot; r++) if (this.isSolid(col, r)) { p.x = (col + 1) * TILE; p.vx = 0; break; }
+      const top = Math.floor(e.y / TILE);
+      const bot = Math.floor((e.y + e.h - 0.001) / TILE);
+      if (e.vx > 0) {
+        const col = Math.floor((e.x + e.w - 0.001) / TILE);
+        for (let r = top; r <= bot; r++) if (this.isSolid(col, r)) { e.x = col * TILE - e.w; e.vx = 0; e.blockedX = true; break; }
+      } else if (e.vx < 0) {
+        const col = Math.floor(e.x / TILE);
+        for (let r = top; r <= bot; r++) if (this.isSolid(col, r)) { e.x = (col + 1) * TILE; e.vx = 0; e.blockedX = true; break; }
       }
     }
-    // Y 轴
-    p.y += p.vy;
-    p.onGround = false;
+    e.y += e.vy;
+    e.onGround = false;
     {
-      const left = Math.floor(p.x / TILE);
-      const right = Math.floor((p.x + p.w - 0.001) / TILE);
-      if (p.vy > 0) {
-        const row = Math.floor((p.y + p.h - 0.001) / TILE);
-        for (let c = left; c <= right; c++) if (this.isSolid(c, row)) { p.y = row * TILE - p.h; p.vy = 0; p.onGround = true; break; }
-      } else if (p.vy < 0) {
-        const row = Math.floor(p.y / TILE);
-        for (let c = left; c <= right; c++) if (this.isSolid(c, row)) { p.y = (row + 1) * TILE; p.vy = 0; break; }
+      const left = Math.floor(e.x / TILE);
+      const right = Math.floor((e.x + e.w - 0.001) / TILE);
+      if (e.vy > 0) {
+        const row = Math.floor((e.y + e.h - 0.001) / TILE);
+        for (let c = left; c <= right; c++) if (this.isSolid(c, row)) { e.y = row * TILE - e.h; e.vy = 0; e.onGround = true; break; }
+      } else if (e.vy < 0) {
+        const row = Math.floor(e.y / TILE);
+        for (let c = left; c <= right; c++) if (this.isSolid(c, row)) { e.y = (row + 1) * TILE; e.vy = 0; break; }
       }
     }
+  };
+
+  Game.prototype._aabb = function (a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
   };
 
   // ---------- 主更新 (固定 60Hz) ----------
@@ -527,10 +800,11 @@
     if (p.vx > 0.01) p.facing = 1;
     else if (p.vx < -0.01) p.facing = -1;
 
-    // 跳跃
-    if ((k['w'] || k[' '] || k['space'] || k['arrowup']) && p.onGround) {
-      p.vy = -JUMP_SPEED;
-      p.onGround = false;
+    // 跳跃 (带缓冲: 短按排队到下一逻辑帧, 落地即跳)
+    if (k['w'] || k[' '] || k['space'] || k['arrowup']) this.jumpQueue = 120;
+    if (this.jumpQueue > 0) {
+      this.jumpQueue -= STEP_MS;
+      if (p.onGround) { p.vy = -JUMP_SPEED; p.onGround = false; this.jumpQueue = 0; }
     }
     // 重力
     p.vy += GRAVITY;
@@ -544,8 +818,14 @@
     // 鼠标动作 (挖掘/放置/攻击)
     this._handleMouseAction();
 
+    // 昼夜与僵尸
+    this._updateDayNight();
+    this._updateZombies();
+
     if (p.invuln > 0) p.invuln -= STEP_MS;
     if (this.craftCooldown > 0) this.craftCooldown -= STEP_MS;
+    if (this.attackCooldown > 0) this.attackCooldown -= STEP_MS;
+    if (this._attackAnim > 0) this._attackAnim -= STEP_MS;
     if (this.messageTime > 0) { this.messageTime -= STEP_MS; if (this.messageTime <= 0) this.message = null; }
   };
 
@@ -568,7 +848,7 @@
     } else if (def.placeable) {
       this.placeTile(m.tx, m.ty);
     } else if (def.tool === 'sword') {
-      // 战斗留待后续阶段
+      this.tryAttack();
     }
   };
 
@@ -640,10 +920,12 @@
     if (!this.ctx) return;
     const ctx = this.ctx;
     this._updateCamera();
-    // 天空
+    // 天空 (昼夜渐变)
+    const sky = this._skyColors();
     const g = ctx.createLinearGradient(0, 0, 0, this.viewH);
-    g.addColorStop(0, '#3a7bd5'); g.addColorStop(1, '#9fd0ff');
+    g.addColorStop(0, sky.top); g.addColorStop(1, sky.bot);
     ctx.fillStyle = g; ctx.fillRect(0, 0, this.viewW, this.viewH);
+    this._drawCelestial(ctx, sky);
 
     const cam = this.camera;
     const x0 = Math.floor(cam.x / TILE), x1 = Math.floor((cam.x + this.viewW) / TILE) + 1;
@@ -656,8 +938,11 @@
       }
     }
     this._drawPlayer(ctx);
+    this._drawZombies(ctx);
     this._drawCrosshair(ctx);
+    this._drawLighting(ctx);
     this._drawHotbar(ctx);
+    this._drawHUD(ctx);
     this._drawMessage(ctx);
     if (this.showInv) this._drawInventory(ctx);
     if (this.showHelp) this._drawHelp(ctx);
@@ -811,10 +1096,11 @@
     const panel = this._invPanelRect();
     ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fillRect(panel.x, panel.y, panel.w, panel.h);
     ctx.strokeStyle = 'rgba(255,224,138,0.8)'; ctx.lineWidth = 2; ctx.strokeRect(panel.x + 0.5, panel.y + 0.5, panel.w - 1, panel.h - 1);
-    ctx.fillStyle = '#ffe08a'; ctx.font = '14px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText('背包 / 合成  (E 或 Tab 关闭 · 点击格子交换 · 点击配方合成)', panel.x + 16, panel.y + 12);
-    ctx.fillStyle = '#ccc'; ctx.font = '11px monospace';
-    ctx.fillText('前 10 格为快捷栏, 可把主背包物品交换上来', panel.x + 16, panel.y + 30);
+    ctx.fillStyle = '#ffe08a'; ctx.font = '13px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('背包 (点击交换)', 56, 58);
+    ctx.fillText('合成 (点击配方)', 416, 58);
+    ctx.fillStyle = '#888'; ctx.font = '10px monospace';
+    ctx.fillText('E/Tab 关闭 · 前10格为快捷栏', 56, 72);
 
     for (let i = 0; i < this.inv.length; i++) {
       const r = this._invSlotRect(i);
@@ -833,8 +1119,7 @@
       }
     }
 
-    ctx.fillStyle = '#ffe08a'; ctx.font = '13px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText('合成配方', 416, 58);
+
     const benchD = this.nearestWorkbenchDist();
     const benchOk = benchD <= 4;
     for (let i = 0; i < RECIPES.length; i++) {
@@ -886,7 +1171,7 @@
       '',
       '第1阶段: 地形/树/移动/碰撞/挖掘/放置/快捷栏',
       '第2阶段: 洞穴/矿脉/合成/工作台/背包交换',
-      '后续阶段: 昼夜 / 僵尸'
+      '第3阶段: 昼夜/日月星空/火把光晕/僵尸/战斗/HP-HUD/重生'
     ];
     for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], 80, 80 + i * 20);
   };
