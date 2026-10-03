@@ -70,6 +70,22 @@
     stick:    { name: '木棍',   stack: 99 }
   };
 
+  // 合成配方: out 产物, need 材料, bench 是否需要工作台(4格内)
+  const RECIPES = [
+    { name: '木板',   out: { id: 'planks',  n: 4 }, need: [{ id: 'wood', n: 1 }],              bench: false },
+    { name: '木棍',   out: { id: 'stick',   n: 4 }, need: [{ id: 'planks', n: 2 }],            bench: false },
+    { name: '工作台', out: { id: 'workbench', n: 1 }, need: [{ id: 'planks', n: 4 }],          bench: false },
+    { name: '火把',   out: { id: 'torch',   n: 4 }, need: [{ id: 'stick', n: 1 }, { id: 'coal', n: 1 }], bench: false },
+    { name: '木镐',   out: { id: 'pickaxe_wood',  n: 1 }, need: [{ id: 'planks', n: 3 }, { id: 'stick', n: 2 }], bench: true },
+    { name: '木剑',   out: { id: 'sword_wood',    n: 1 }, need: [{ id: 'planks', n: 2 }, { id: 'stick', n: 1 }], bench: true },
+    { name: '石镐',   out: { id: 'pickaxe_stone', n: 1 }, need: [{ id: 'stone', n: 3 }, { id: 'stick', n: 2 }], bench: true },
+    { name: '石剑',   out: { id: 'sword_stone',   n: 1 }, need: [{ id: 'stone', n: 2 }, { id: 'stick', n: 1 }], bench: true },
+    { name: '铁镐',   out: { id: 'pickaxe_iron',  n: 1 }, need: [{ id: 'iron', n: 3 }, { id: 'stick', n: 2 }], bench: true },
+    { name: '铁剑',   out: { id: 'sword_iron',    n: 1 }, need: [{ id: 'iron', n: 2 }, { id: 'stick', n: 1 }], bench: true },
+    { name: '金镐',   out: { id: 'pickaxe_gold',  n: 1 }, need: [{ id: 'gold', n: 3 }, { id: 'stick', n: 2 }], bench: true },
+    { name: '金剑',   out: { id: 'sword_gold',    n: 1 }, need: [{ id: 'gold', n: 2 }, { id: 'stick', n: 1 }], bench: true }
+  ];
+
   // ===================== 随机 / 噪声 =====================
   function mulberry32(a) {
     return function () {
@@ -91,6 +107,24 @@
       return at(i) + (at(i + 1) - at(i)) * fade(f);
     };
   }
+  function makeNoise2D(seed) {
+    const rng = mulberry32(seed * 2654435761 | 0);
+    const N = 128;
+    const buf = new Float32Array(N * N);
+    for (let i = 0; i < buf.length; i++) buf[i] = rng();
+    function at(ix, iy) {
+      ix = ((ix % N) + N) % N; iy = ((iy % N) + N) % N;
+      return buf[iy * N + ix];
+    }
+    function fade(t) { return t * t * (3 - 2 * t); }
+    return function (x, y) {
+      const ix = Math.floor(x), iy = Math.floor(y);
+      const fx = x - ix, fy = y - iy;
+      const a = at(ix, iy), b = at(ix + 1, iy), c = at(ix, iy + 1), d = at(ix + 1, iy + 1);
+      const u = fade(fx), v = fade(fy);
+      return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+    };
+  }
 
   // ===================== Game 类 =====================
   function Game(opts) {
@@ -108,6 +142,8 @@
     this.time = 0;                // 累计毫秒
     this.dayLen = opts.dayLen || 120000; // 一天一夜总时长(ms)，第1阶段仅占位
     this.dayCount = 1;
+    this.message = null; this.messageTime = 0;
+    this.uiPick = null; this.craftCooldown = 0;
 
     this._initWorld();
     this._initPlayer();
@@ -156,6 +192,43 @@
         }
         this._trees.push({ x: x, base: h, top: cy });
         lastTree = x;
+      }
+    }
+    // 洞穴 (2D 噪声掏洞, 仅在石头区)
+    const caveN = makeNoise2D(this.seed + 7);
+    const caveN2 = makeNoise2D(this.seed + 13);
+    for (let x = 0; x < W; x++) {
+      const s = this.surface[x];
+      for (let y = s + 5; y < H - 1; y++) {
+        if (this.getTile(x, y) !== T.STONE) continue;
+        const v = caveN(x * 0.10, y * 0.10) * 0.7 + caveN2(x * 0.05, y * 0.05) * 0.3;
+        if (v > 0.80) this.setTile(x, y, T.AIR);
+      }
+    }
+    // 矿脉 (随机游走, 分层: 煤浅/铁中/金深)
+    this._genOres(rng, T.COAL, 6, 30, 46, 5, 9);
+    this._genOres(rng, T.IRON, 25, 60, 32, 4, 7);
+    this._genOres(rng, T.GOLD, 50, 999, 20, 3, 6);
+  };
+
+  Game.prototype._genOres = function (rng, ore, minDepth, maxDepth, count, minSize, maxSize) {
+    const W = this.W, H = this.H;
+    for (let k = 0; k < count; k++) {
+      const x = 2 + ((rng() * (W - 4)) | 0);
+      const s = this.surface[x];
+      const lo = Math.min(H - 2, s + minDepth);
+      const hi = Math.min(H - 2, s + maxDepth);
+      if (hi <= lo) continue;
+      let cx = x, cy = lo + ((rng() * (hi - lo)) | 0);
+      const size = minSize + ((rng() * (maxSize - minSize + 1)) | 0);
+      for (let i = 0; i < size; i++) {
+        if (this.getTile(cx, cy) === T.STONE) this.setTile(cx, cy, ore);
+        const r = rng();
+        if (r < 0.4) cx += 1; else if (r < 0.8) cx -= 1;
+        const r2 = rng();
+        if (r2 < 0.45) cy += 1; else if (r2 < 0.7) cy -= 1;
+        if (cx < 1) cx = 1; if (cx > W - 2) cx = W - 2;
+        if (cy < 1) cy = 1; if (cy > H - 2) cy = H - 2;
       }
     }
   };
@@ -255,6 +328,58 @@
   Game.prototype.selectedSlot = function () { return this.inv[this.selected]; };
   Game.prototype.selectSlot = function (i) { if (i >= 0 && i < 10) this.selected = i; };
 
+  // ---------- 合成 ----------
+  Game.prototype.setMessage = function (msg, ms) { this.message = msg; this.messageTime = ms || 2000; };
+  Game.prototype.nearestWorkbenchDist = function () {
+    const p = this.player;
+    const px = (p.x + p.w / 2) / TILE, py = (p.y + p.h / 2) / TILE;
+    let best = Infinity;
+    const R = 8;
+    const x0 = Math.max(0, Math.floor(px - R)), x1 = Math.min(this.W - 1, Math.ceil(px + R));
+    const y0 = Math.max(0, Math.floor(py - R)), y1 = Math.min(this.H - 1, Math.ceil(py + R));
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      if (this.getTile(x, y) === T.WORKBENCH) {
+        const d = Math.hypot(x + 0.5 - px, y + 0.5 - py);
+        if (d < best) best = d;
+      }
+    }
+    return best;
+  };
+  Game.prototype.nearWorkbench = function () { return this.nearestWorkbenchDist() <= 4; };
+
+  Game.prototype.canCraft = function (idx) {
+    const r = RECIPES[idx];
+    if (!r) return { ok: false, reason: '未知配方' };
+    for (let i = 0; i < r.need.length; i++) {
+      if (!this.hasItem(r.need[i].id, r.need[i].n)) {
+        return { ok: false, reason: '材料不足: ' + ITEMS[r.need[i].id].name };
+      }
+    }
+    if (r.bench) {
+      const d = this.nearestWorkbenchDist();
+      if (d > 4) return { ok: false, reason: '需要靠近工作台 (当前距离 ' + d.toFixed(1) + ' 格)' };
+    }
+    return { ok: true, reason: '可合成' };
+  };
+
+  Game.prototype.craft = function (idx) {
+    const c = this.canCraft(idx);
+    if (!c.ok) { this.setMessage(c.reason); return c; }
+    const r = RECIPES[idx];
+    for (let i = 0; i < r.need.length; i++) this._removeItem(r.need[i].id, r.need[i].n);
+    const left = this._addItem(r.out.id, r.out.n);
+    this.setMessage('合成完成: ' + r.name + (left > 0 ? ' (背包满, 丢弃 ' + left + ')' : ''));
+    this.craftCooldown = 300;
+    return { ok: true, reason: '合成完成' };
+  };
+  Game.prototype.recipes = function () { return RECIPES; };
+
+  Game.prototype.swapSlots = function (a, b) {
+    if (a < 0 || b < 0 || a >= this.inv.length || b >= this.inv.length || a === b) return false;
+    const t = this.inv[a]; this.inv[a] = this.inv[b]; this.inv[b] = t;
+    return true;
+  };
+
   // ---------- 输入 ----------
   Game.prototype.setKey = function (k, v) { this.keys[k] = v; };
   Game.prototype.setMouse = function (x, y, down, button) {
@@ -299,6 +424,25 @@
     this.setTile(tx, ty, T.AIR);
     if (def.drop) this._addItem(def.drop, 1);
     return true;
+  };
+
+  // 带反馈的挖掘尝试 (UI 用), 返回 {ok,reason}
+  Game.prototype.tryMine = function (tx, ty) {
+    if (!this.inBounds(tx, ty)) return { ok: false, reason: '越界' };
+    const t = this.getTile(tx, ty);
+    if (t === T.AIR) return { ok: false, reason: '空气' };
+    const def = TILE_DEF[t];
+    const tier = this._pickTier();
+    if (tier <= 0) { this.setMessage('请选择镐子'); return { ok: false, reason: '未选镐' }; }
+    if (!this._reachOk(tx, ty)) { this.setMessage('距离太远'); return { ok: false, reason: '距离太远' }; }
+    if ((def.tier || 1) > tier) {
+      const need = ['?', '木镐', '石镐', '铁镐', '金镐'][def.tier || 1];
+      this.setMessage('需要 ' + need + ' 才能挖掘 ' + def.name);
+      return { ok: false, reason: '等级不足' };
+    }
+    this.setTile(tx, ty, T.AIR);
+    if (def.drop) this._addItem(def.drop, 1);
+    return { ok: true, reason: 'ok' };
   };
 
   // 在指定空格放置当前选中方块. 返回 true 表示成功.
@@ -401,6 +545,8 @@
     this._handleMouseAction();
 
     if (p.invuln > 0) p.invuln -= STEP_MS;
+    if (this.craftCooldown > 0) this.craftCooldown -= STEP_MS;
+    if (this.messageTime > 0) { this.messageTime -= STEP_MS; if (this.messageTime <= 0) this.message = null; }
   };
 
   Game.prototype._mouseTile = function () {
@@ -410,6 +556,7 @@
   };
 
   Game.prototype._handleMouseAction = function () {
+    if (this.showInv) return;                       // 背包打开时不挖掘
     if (!this.mouse.down || this.mouse.button !== 0) { this.player.miningTx = -1; return; }
     const m = this._mouseTile();
     const s = this.selectedSlot();
@@ -417,7 +564,7 @@
     const def = ITEMS[s.item];
     if (!def) return;
     if (def.tool === 'pickaxe') {
-      if (this.mineTile(m.tx, m.ty)) { /* 第1阶段: 即时破坏 */ }
+      this.tryMine(m.tx, m.ty);
     } else if (def.placeable) {
       this.placeTile(m.tx, m.ty);
     } else if (def.tool === 'sword') {
@@ -453,7 +600,13 @@
     window.addEventListener('keyup', function (e) { self.keys[e.key.toLowerCase()] = false; });
     c.addEventListener('mousedown', function (e) {
       const r = c.getBoundingClientRect();
-      self.setMouse((e.clientX - r.left) * (c.width / r.width), (e.clientY - r.top) * (c.height / r.height), true, e.button);
+      const mx = (e.clientX - r.left) * (c.width / r.width);
+      const my = (e.clientY - r.top) * (c.height / r.height);
+      self.setMouse(mx, my);
+      if (self.showInv) {
+        if (self._handleInvClick(mx, my)) { e.preventDefault(); return; }
+      }
+      self.setMouse(mx, my, true, e.button);
     });
     window.addEventListener('mouseup', function () { self.mouse.down = false; });
     c.addEventListener('mousemove', function (e) {
@@ -505,6 +658,7 @@
     this._drawPlayer(ctx);
     this._drawCrosshair(ctx);
     this._drawHotbar(ctx);
+    this._drawMessage(ctx);
     if (this.showInv) this._drawInventory(ctx);
     if (this.showHelp) this._drawHelp(ctx);
   };
@@ -621,26 +775,100 @@
     }
   };
 
-  Game.prototype._drawInventory = function (ctx) {
-    ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(40, 40, this.viewW - 80, this.viewH - 80);
-    ctx.fillStyle = '#fff'; ctx.font = '14px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText('背包 (E/Tab 关闭) — 合成系统将在后续阶段加入', 56, 52);
-    const cols = 10, sz = 32, gap = 4;
-    let x0 = 56, y0 = 80;
+  Game.prototype._invPanelRect = function () { return { x: 40, y: 40, w: this.viewW - 80, h: this.viewH - 80 }; };
+  Game.prototype._invSlotRect = function (i) {
+    const cols = 10, sz = 32, gap = 4, x0 = 56, y0 = 80;
+    const col = i % cols, row = (i / cols) | 0;
+    return { x: x0 + col * (sz + gap), y: y0 + row * (sz + gap), w: sz, h: sz };
+  };
+  Game.prototype._recipeRect = function (i) {
+    const panel = this._invPanelRect();
+    const x = 416, y0 = 78, rh = 28;
+    return { x: x, y: y0 + i * rh, w: panel.x + panel.w - x - 16, h: rh - 4 };
+  };
+
+  Game.prototype._handleInvClick = function (mx, my) {
+    const panel = this._invPanelRect();
+    if (mx < panel.x || mx > panel.x + panel.w || my < panel.y || my > panel.y + panel.h) {
+      this.showInv = false; return true;
+    }
     for (let i = 0; i < this.inv.length; i++) {
-      const col = i % cols, row = (i / cols) | 0;
-      const x = x0 + col * (sz + gap), y = y0 + row * (sz + gap);
-      ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(x, y, sz, sz);
-      ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, sz - 1, sz - 1);
+      const r = this._invSlotRect(i);
+      if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h) {
+        if (this.uiPick === null || this.uiPick === undefined) this.uiPick = i;
+        else { this.swapSlots(this.uiPick, i); this.uiPick = null; }
+        return true;
+      }
+    }
+    for (let i = 0; i < RECIPES.length; i++) {
+      const r = this._recipeRect(i);
+      if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h) { this.craft(i); return true; }
+    }
+    return true;
+  };
+
+  Game.prototype._drawInventory = function (ctx) {
+    const panel = this._invPanelRect();
+    ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fillRect(panel.x, panel.y, panel.w, panel.h);
+    ctx.strokeStyle = 'rgba(255,224,138,0.8)'; ctx.lineWidth = 2; ctx.strokeRect(panel.x + 0.5, panel.y + 0.5, panel.w - 1, panel.h - 1);
+    ctx.fillStyle = '#ffe08a'; ctx.font = '14px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('背包 / 合成  (E 或 Tab 关闭 · 点击格子交换 · 点击配方合成)', panel.x + 16, panel.y + 12);
+    ctx.fillStyle = '#ccc'; ctx.font = '11px monospace';
+    ctx.fillText('前 10 格为快捷栏, 可把主背包物品交换上来', panel.x + 16, panel.y + 30);
+
+    for (let i = 0; i < this.inv.length; i++) {
+      const r = this._invSlotRect(i);
+      ctx.fillStyle = i < 10 ? 'rgba(255,224,138,0.10)' : 'rgba(255,255,255,0.06)';
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.strokeStyle = (this.uiPick === i) ? '#ffe08a' : (i < 10 ? 'rgba(255,224,138,0.5)' : 'rgba(255,255,255,0.35)');
+      ctx.lineWidth = (this.uiPick === i) ? 3 : 1;
+      ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
       const s = this.inv[i];
       if (s && s.item) {
-        this._drawItemIcon(ctx, s.item, x + 3, y + 3, sz - 6);
+        this._drawItemIcon(ctx, s.item, r.x + 3, r.y + 3, r.w - 6);
         if (s.count > 1) {
           ctx.fillStyle = '#fff'; ctx.font = '11px monospace'; ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
-          ctx.fillText(s.count, x + sz - 2, y + sz - 1);
+          ctx.fillText(s.count, r.x + r.w - 2, r.y + r.h - 1);
         }
       }
     }
+
+    ctx.fillStyle = '#ffe08a'; ctx.font = '13px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('合成配方', 416, 58);
+    const benchD = this.nearestWorkbenchDist();
+    const benchOk = benchD <= 4;
+    for (let i = 0; i < RECIPES.length; i++) {
+      const r = RECIPES[i];
+      const rr = this._recipeRect(i);
+      const c = this.canCraft(i);
+      ctx.fillStyle = c.ok ? 'rgba(90,180,90,0.25)' : 'rgba(180,60,60,0.18)';
+      ctx.fillRect(rr.x, rr.y, rr.w, rr.h);
+      ctx.strokeStyle = c.ok ? '#7f7' : '#777'; ctx.lineWidth = 1; ctx.strokeRect(rr.x + 0.5, rr.y + 0.5, rr.w - 1, rr.h - 1);
+      this._drawItemIcon(ctx, r.out.id, rr.x + 3, rr.y + 3, 18);
+      ctx.fillStyle = '#fff'; ctx.font = '12px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.fillText(r.name + ' ×' + r.out.n + (r.bench ? ' [需工作台]' : ''), rr.x + 26, rr.y + 2);
+      const mat = r.need.map(function (n) { return ITEMS[n.id].name + '×' + n.n; }).join('  ');
+      ctx.fillStyle = '#bbb'; ctx.font = '10px monospace';
+      ctx.fillText(mat, rr.x + 26, rr.y + 15);
+      ctx.fillStyle = c.ok ? '#9f9' : '#f88'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+      ctx.fillText(c.ok ? '可合成' : '不可', rr.x + rr.w - 4, rr.y + 2);
+    }
+    ctx.fillStyle = benchOk ? '#9f9' : '#f88'; ctx.font = '11px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText(benchOk ? '工作台已就位 (距离 ' + benchD.toFixed(1) + ' 格)' : '附近无工作台 (高级配方不可用)', 416, panel.y + panel.h - 22);
+    if (this.message) {
+      ctx.fillStyle = '#ffe08a'; ctx.font = '12px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.fillText(this.message, panel.x + 16, panel.y + panel.h - 22);
+    }
+  };
+
+  Game.prototype._drawMessage = function (ctx) {
+    if (!this.message || this.messageTime <= 0) return;
+    ctx.font = '13px monospace';
+    const w = ctx.measureText(this.message).width + 16;
+    const x = (this.viewW - w) / 2, y = 10;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(x, y, w, 22);
+    ctx.fillStyle = '#ffe08a'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText(this.message, x + 8, y + 4);
   };
 
   Game.prototype._drawHelp = function (ctx) {
@@ -656,14 +884,15 @@
       'E / Tab   打开/关闭背包合成',
       'H         帮助',
       '',
-      '第1阶段已实现: 地形/树/移动/碰撞/挖掘/放置/快捷栏',
-      '后续阶段: 洞穴矿脉 / 合成 / 昼夜 / 僵尸'
+      '第1阶段: 地形/树/移动/碰撞/挖掘/放置/快捷栏',
+      '第2阶段: 洞穴/矿脉/合成/工作台/背包交换',
+      '后续阶段: 昼夜 / 僵尸'
     ];
     for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], 80, 80 + i * 20);
   };
 
   // ===================== 导出 / 自动启动 =====================
-  Game.T = T; Game.TILE_DEF = TILE_DEF; Game.ITEMS = ITEMS;
+  Game.T = T; Game.TILE_DEF = TILE_DEF; Game.ITEMS = ITEMS; Game.RECIPES = RECIPES;
   Game.TILE = TILE; Game.MAX_HP = MAX_HP; Game.STEP_MS = STEP_MS;
 
   global.TerrariaGame = Game;
