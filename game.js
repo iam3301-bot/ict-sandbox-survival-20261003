@@ -1,7 +1,7 @@
 'use strict';
 /*
  * 2D 侧视沙盒生存游戏 (泰拉瑞亚风格) — 纯 HTML5 Canvas + 原生 JS
- * 第1阶段：地形/树/移动/跳跃/AABB碰撞/木镐挖掘/方块放置/10格快捷栏
+ * 地形、矿脉、建造、合成、昼夜、火把照明与僵尸战斗。
  * 可被 Node require (headless) 用于无头测试。
  */
 (function (global) {
@@ -149,7 +149,9 @@
     this.maxZombies = opts.maxZombies || 8;
     this.attackCooldown = 0;
     this._attackAnim = 0;
-    this.jumpQueue = 0;                  // 跳跃缓冲(ms)
+    this.jumpQueue = 0;
+    this.moveTap = Object.create(null);
+    this.mineCooldown = 0;                  // 跳跃缓冲(ms)
     this.dead = false;
     this.message = null; this.messageTime = 0;
     this.uiPick = null; this.craftCooldown = 0;
@@ -272,29 +274,21 @@
     this.camera = { x: 0, y: 0 };
   };
 
-  // 寻找安全出生点: 附近无树的列, 并挖出 3x4 口袋避免卡墙
+  // 在现有地形中寻找可站立的空位，重生不会破坏玩家建造。
   Game.prototype._findSafeSpawn = function () {
-    const cx = (this.W >> 1);
-    let col = -1;
-    for (let off = 0; off < this.W && col < 0; off++) {
-      const cands = off === 0 ? [cx] : [cx + off, cx - off];
-      for (let ci = 0; ci < cands.length; ci++) {
-        const x = cands[ci];
-        if (x < 3 || x > this.W - 4) continue;
-        let ok = true;
-        outer: for (let dx = -2; dx <= 2; dx++) {
-          for (let dy = 1; dy <= 6; dy++) {
-            const t = this.getTile(x + dx, this.surface[x] - dy);
-            if (t === T.WOOD || t === T.LEAVES) { ok = false; break outer; }
+    const cx = this.W >> 1;
+    for (let off = 0; off < this.W; off++) {
+      for (const col of off === 0 ? [cx] : [cx + off, cx - off]) {
+        if (col < 2 || col >= this.W - 2) continue;
+        const surface = this.surface[col];
+        for (let row = Math.max(2, surface - 8); row < Math.min(this.H - 2, surface + 20); row++) {
+          if (this.isSolid(col, row) && !this.isSolid(col, row - 1) && !this.isSolid(col, row - 2)) {
+            return {x: col * TILE + 1, y: row * TILE - 28};
           }
         }
-        if (ok) { col = x; break; }
       }
     }
-    if (col < 0) col = cx;
-    const sy = this.surface[col];
-    for (let dx = -1; dx <= 1; dx++) for (let dy = 1; dy <= 4; dy++) this.setTile(col + dx, sy - dy, T.AIR);
-    return { x: col * TILE + (TILE - 14) / 2, y: (sy - 4) * TILE };
+    return {x: cx * TILE + 1, y: 0};
   };
 
   Game.prototype.respawn = function () {
@@ -454,22 +448,27 @@
 
   // ---------- 僵尸 ----------
   Game.prototype._spawnZombie = function () {
-    const p = this.player;
-    const pcol = Math.floor((p.x + p.w / 2) / TILE);
-    const side = Math.random() < 0.5 ? -1 : 1;
-    const dist = 18 + ((Math.random() * 14) | 0);
-    let col = pcol + side * dist;
-    col = Math.max(2, Math.min(this.W - 3, col));
-    const sy = this.surface[col];
-    this.setTile(col, sy - 1, T.AIR);
-    this.zombies.push({
-      x: col * TILE + 1, y: (sy - 2) * TILE,
-      w: 12, h: 26,
-      vx: 0, vy: 0, onGround: false, blockedX: false,
-      facing: -side,
-      hp: 8, maxHp: 8,
-      speed: 1.4 + Math.random() * 0.7
-    });
+    this._updateCamera();
+    const side = this._rng() < 0.5 ? -1 : 1;
+    const edges = [this.camera.x - 2 * TILE, this.camera.x + this.viewW + TILE];
+    for (const direction of [side, -side]) {
+      const edge = edges[direction > 0 ? 1 : 0];
+      for (let offset = 0; offset < 12; offset++) {
+        const col = Math.floor(edge / TILE) + direction * offset;
+        if (col < 1 || col >= this.W - 1) continue;
+        let row = this.surface[col];
+        for (let y = Math.max(2, row - 3); y < Math.min(this.H - 2, row + 12); y++) {
+          if (!this.isSolid(col, y) || this.isSolid(col, y - 1) || this.isSolid(col, y - 2)) continue;
+          const x = col * TILE + 1;
+          if (x + 12 > this.camera.x && x < this.camera.x + this.viewW) continue;
+          this.zombies.push({x, y: y * TILE - 26, w: 12, h: 26, vx: 0, vy: 0,
+            onGround: true, blockedX: false, facing: -direction, hp: 8, maxHp: 8,
+            speed: 1.4 + this._rng() * 0.7});
+          return true;
+        }
+      }
+    }
+    return false;
   };
   Game.prototype.spawnZombie = function (side) {
     const p = this.player;
@@ -524,6 +523,7 @@
     let hit = false, killed = 0;
     for (let i = 0; i < this.zombies.length; i++) {
       const z = this.zombies[i];
+      if (z.hp <= 0) continue;
       if (hx < z.x + z.w && hx + hw > z.x && hy < z.y + z.h && hy + hh > z.y) {
         z.hp -= sd.dmg;
         z.vx = p.facing * 5; z.vy = -3;
@@ -577,7 +577,7 @@
     const y0 = Math.floor(cam.y / TILE), y1 = Math.floor((cam.y + this.viewH) / TILE) + 1;
     for (let ty = y0; ty <= y1; ty++) {
       for (let tx = x0; tx <= x1; tx++) {
-        if (this.getTile(tx, ty) !== T.AIR) continue;
+        if (!this.inBounds(tx, ty)) continue;
         const surf = this.surface[tx];
         let light;
         if (ty <= surf) light = amb;
@@ -649,7 +649,14 @@
   };
 
   // ---------- 输入 ----------
-  Game.prototype.setKey = function (k, v) { this.keys[k] = v; };
+  Game.prototype.setKey = function (k, v) {
+    k = k.toLowerCase();
+    if (v && !this.keys[k]) {
+      if (['w', ' ', 'space', 'arrowup'].includes(k)) this.jumpQueue = 120;
+      if (['a', 'd', 'arrowleft', 'arrowright'].includes(k)) this.moveTap[k] = true;
+    }
+    this.keys[k] = v;
+  };
   Game.prototype.setMouse = function (x, y, down, button) {
     this.mouse.x = x; this.mouse.y = y;
     if (down !== undefined) { this.mouse.down = down; this.mouse.button = button || 0; }
@@ -699,6 +706,7 @@
     if (!this.inBounds(tx, ty)) return { ok: false, reason: '越界' };
     const t = this.getTile(tx, ty);
     if (t === T.AIR) return { ok: false, reason: '空气' };
+    if (this.mineCooldown > 0) return { ok: false, reason: '挖掘冷却' };
     const def = TILE_DEF[t];
     const tier = this._pickTier();
     if (tier <= 0) { this.setMessage('请选择镐子'); return { ok: false, reason: '未选镐' }; }
@@ -710,6 +718,7 @@
     }
     this.setTile(tx, ty, T.AIR);
     if (def.drop) this._addItem(def.drop, 1);
+    this.mineCooldown = 160 / tier;
     return { ok: true, reason: 'ok' };
   };
 
@@ -790,8 +799,9 @@
 
     // 水平输入
     let ax = 0;
-    if (k['a'] || k['arrowleft']) ax -= MOVE_ACCEL;
-    if (k['d'] || k['arrowright']) ax += MOVE_ACCEL;
+    if (k['a'] || k['arrowleft'] || this.moveTap['a'] || this.moveTap['arrowleft']) ax -= MOVE_ACCEL;
+    if (k['d'] || k['arrowright'] || this.moveTap['d'] || this.moveTap['arrowright']) ax += MOVE_ACCEL;
+    this.moveTap = Object.create(null);
     p.vx += ax;
     if (ax === 0) p.vx *= FRICTION;
     if (p.vx > MOVE_MAX) p.vx = MOVE_MAX;
@@ -822,10 +832,11 @@
     this._updateDayNight();
     this._updateZombies();
 
-    if (p.invuln > 0) p.invuln -= STEP_MS;
-    if (this.craftCooldown > 0) this.craftCooldown -= STEP_MS;
-    if (this.attackCooldown > 0) this.attackCooldown -= STEP_MS;
-    if (this._attackAnim > 0) this._attackAnim -= STEP_MS;
+    if (p.invuln > 0) p.invuln = Math.max(0, p.invuln - STEP_MS);
+    if (this.mineCooldown > 0) this.mineCooldown = Math.max(0, this.mineCooldown - STEP_MS);
+    if (this.craftCooldown > 0) this.craftCooldown = Math.max(0, this.craftCooldown - STEP_MS);
+    if (this.attackCooldown > 0) this.attackCooldown = Math.max(0, this.attackCooldown - STEP_MS);
+    if (this._attackAnim > 0) this._attackAnim = Math.max(0, this._attackAnim - STEP_MS);
     if (this.messageTime > 0) { this.messageTime -= STEP_MS; if (this.messageTime <= 0) this.message = null; }
   };
 
@@ -868,16 +879,17 @@
     const self = this, c = this.canvas;
     window.addEventListener('keydown', function (e) {
       const key = e.key.toLowerCase();
-      self.keys[key] = true;
+      self.setKey(key, true);
       if (key >= '0' && key <= '9') {
         self.selectSlot(key === '0' ? 9 : parseInt(key, 10) - 1);
       }
-      if (key === 'tab') { self.showInv = !self.showInv; e.preventDefault(); }
-      if (key === 'e') self.showInv = !self.showInv;
-      if (key === 'h') self.showHelp = !self.showHelp;
+      if (!e.repeat && key === 'tab') { self.showInv = !self.showInv; e.preventDefault(); }
+      if (!e.repeat && key === 'e') self.showInv = !self.showInv;
+      if (!e.repeat && key === 'h') self.showHelp = !self.showHelp;
       if (key === ' ' || key === 'arrowup' || key === 'arrowdown') e.preventDefault();
     });
-    window.addEventListener('keyup', function (e) { self.keys[e.key.toLowerCase()] = false; });
+    window.addEventListener('keyup', function (e) { self.setKey(e.key, false); });
+    window.addEventListener('blur', function () { self.keys = Object.create(null); self.moveTap = Object.create(null); self.mouse.down = false; });
     c.addEventListener('mousedown', function (e) {
       const r = c.getBoundingClientRect();
       const mx = (e.clientX - r.left) * (c.width / r.width);
@@ -887,6 +899,7 @@
         if (self._handleInvClick(mx, my)) { e.preventDefault(); return; }
       }
       self.setMouse(mx, my, true, e.button);
+      self._handleMouseAction();
     });
     window.addEventListener('mouseup', function () { self.mouse.down = false; });
     c.addEventListener('mousemove', function (e) {
@@ -901,8 +914,10 @@
     }, { passive: false });
   };
 
-  Game.prototype._loop = function () {
-    this.update(STEP_MS);
+  Game.prototype._loop = function (timestamp) {
+    const elapsed = this._lastFrame === undefined ? STEP_MS : Math.max(0, Math.min(250, timestamp - this._lastFrame));
+    this._lastFrame = timestamp;
+    this.update(elapsed);
     this.render();
     requestAnimationFrame(this._loopBound);
   };
@@ -1169,9 +1184,9 @@
       'E / Tab   打开/关闭背包合成',
       'H         帮助',
       '',
-      '第1阶段: 地形/树/移动/碰撞/挖掘/放置/快捷栏',
-      '第2阶段: 洞穴/矿脉/合成/工作台/背包交换',
-      '第3阶段: 昼夜/日月星空/火把光晕/僵尸/战斗/HP-HUD/重生'
+      '挖树取得木头 → 合成木板、木棍和工作台',
+      '靠近工作台升级工具 → 挖矿和建造避难所',
+      '夜晚用剑抵御僵尸 · 火把照明 · 击杀获金币'
     ];
     for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], 80, 80 + i * 20);
   };
