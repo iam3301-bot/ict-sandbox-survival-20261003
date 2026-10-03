@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>2D沙盒生存 · 泰拉瑞亚风格</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0b14;overflow:hidden;font-family:"Microsoft YaHei","PingFang SC",sans-serif;user-select:none;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{image-rendering:pixelated;image-rendering:crisp-edges;background:#87ceeb;border:0;cursor:crosshair;}
+  #hint{position:fixed;top:6px;left:8px;color:#fff;font-size:13px;text-shadow:1px 1px 2px #000;pointer-events:none;line-height:1.6;max-width:70%;}
+  #hint b{color:#ffe08a;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<div id="hint">A/D 移动 · W/空格 跳跃 · 左键 挖掘/放置/攻击 · 滚轮或 1-0 切换 · E/Tab 背包合成 · H 帮助</div>
+<script src="game.js"></script>
+</body>
+</html>
